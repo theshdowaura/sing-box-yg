@@ -67,16 +67,133 @@ bbr="Openvz/Lxc"
 fi
 hostname=$(hostname)
 
+# Security baseline:
+# 1) Always download over HTTPS with strict TLS.
+# 2) Verify file integrity when upstream provides digest (GitHub release API) or we pin SHA256.
+# 3) Never persist GitLab access token to disk.
+ACME_REPO_COMMIT="14c0a01851778343477c96d9a451d30720d317ce"
+ACME_SCRIPT_SHA256="455abf7a993a66af0b89cad68d3c7fcc7c673408af40bceb9e0b7cd02dcd71f4"
+WARP_REPO_COMMIT="28b6fb420e1f4f95052cc3e9395dfad0b556936c"
+WARP_SCRIPT_SHA256="05eef374bb937eb37111c66f068d29646e7b60651efa0805354736b180dee62a"
+BBR_REPO_COMMIT="ac11f0d4c51e82b9d6b119e19601232c63a62d2d"
+BBR_SCRIPT_SHA256="17f447d78ba82468727e97cfdaa2a18150840a4c00c207592e5329df36544e85"
+SBWPPH_AMD64_SHA256="9b9fbc7d709966b2170c075c71ad3a78628bacf1daed3a960bfa8482faff4a1e"
+SBWPPH_ARM64_SHA256="8a8f48b096a630fc07a1a361b61c7f72ba28657afe88dff2a523bc70432a29a6"
+CLOUDFLARED_TAG="${CLOUDFLARED_TAG:-2026.2.0}"
+
+sha256_file() {
+local file="$1"
+if command -v sha256sum >/dev/null 2>&1; then
+sha256sum "$file" | awk '{print $1}'
+else
+shasum -a 256 "$file" | awk '{print $1}'
+fi
+}
+
+safe_download() {
+local url="$1"
+local output="$2"
+curl --fail --location --show-error --silent --proto '=https' --tlsv1.2 --retry 3 --connect-timeout 10 --max-time 300 -o "$output" "$url"
+}
+
+verify_sha256_or_fail() {
+local file="$1"
+local expected="$2"
+local actual
+actual=$(sha256_file "$file")
+if [[ "$actual" != "$expected" ]]; then
+rm -f "$file"
+red "文件校验失败: $file"
+red "预期: $expected"
+red "实际: $actual"
+return 1
+fi
+return 0
+}
+
+download_release_asset_with_digest() {
+local repo="$1"
+local tag="$2"
+local asset_name="$3"
+local output="$4"
+local release_json asset_url digest algo expected actual
+
+release_json=$(curl --fail --location --show-error --silent --proto '=https' --tlsv1.2 "https://api.github.com/repos/${repo}/releases/tags/${tag}") || return 1
+asset_url=$(echo "$release_json" | jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | .browser_download_url' | head -n 1)
+digest=$(echo "$release_json" | jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | .digest' | head -n 1)
+
+if [[ -z "$asset_url" || "$asset_url" == "null" ]]; then
+red "未找到资产: ${asset_name} (${repo}@${tag})"
+return 1
+fi
+
+safe_download "$asset_url" "$output" || return 1
+
+if [[ -n "$digest" && "$digest" != "null" ]]; then
+algo="${digest%%:*}"
+expected="${digest#*:}"
+if ! command -v "${algo}sum" >/dev/null 2>&1; then
+red "系统缺少 ${algo}sum，无法校验 ${asset_name}"
+rm -f "$output"
+return 1
+fi
+actual=$("${algo}sum" "$output" | awk '{print $1}')
+if [[ "$actual" != "$expected" ]]; then
+rm -f "$output"
+red "下载文件摘要不匹配: ${asset_name}"
+return 1
+fi
+else
+yellow "警告: 上游未提供摘要，已仅使用 HTTPS 下载 ${asset_name}"
+fi
+return 0
+}
+
+run_pinned_script() {
+local owner_repo="$1"
+local commit="$2"
+local file_path="$3"
+local expected_sha="$4"
+local tmp_file
+tmp_file=$(mktemp /tmp/sbyg-script.XXXXXX) || return 1
+safe_download "https://raw.githubusercontent.com/${owner_repo}/${commit}/${file_path}" "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+verify_sha256_or_fail "$tmp_file" "$expected_sha" || return 1
+bash "$tmp_file"
+local rc=$?
+rm -f "$tmp_file"
+return $rc
+}
+
+gitlab_push_with_token() {
+local token="$1"
+local branch_spec="$2"
+local askpass_file
+askpass_file=$(mktemp /tmp/sbyg-askpass.XXXXXX) || return 1
+cat > "$askpass_file" <<'EOF'
+#!/bin/sh
+case "$1" in
+  *Username*) printf '%s\n' "oauth2" ;;
+  *Password*) printf '%s\n' "$GITLAB_PUSH_TOKEN" ;;
+  *) printf '\n' ;;
+esac
+EOF
+chmod 700 "$askpass_file"
+GITLAB_PUSH_TOKEN="$token" GIT_ASKPASS="$askpass_file" GIT_TERMINAL_PROMPT=0 git push -f origin "main${branch_spec}" >/dev/null 2>&1
+local rc=$?
+rm -f "$askpass_file"
+return $rc
+}
+
 if [ ! -f sbyg_update ]; then
 green "首次安装Sing-box-yg脚本必要的依赖……"
 if [[ x"${release}" == x"alpine" ]]; then
 apk update
-apk add jq openssl iproute2 iputils coreutils expect git socat iptables grep util-linux dcron tar tzdata 
+apk add jq openssl iproute2 iputils coreutils git socat iptables grep util-linux dcron tar tzdata 
 apk add virt-what
 else
 if [[ $release = Centos && ${vsid} =~ 8 ]]; then
 cd /etc/yum.repos.d/ && mkdir backup && mv *repo backup/ 
-curl -o /etc/yum.repos.d/CentOS-Base.repo http://mirrors.aliyun.com/repo/Centos-8.repo
+curl -o /etc/yum.repos.d/CentOS-Base.repo https://mirrors.aliyun.com/repo/Centos-8.repo
 sed -i -e "s|mirrors.cloud.aliyuncs.com|mirrors.aliyun.com|g " /etc/yum.repos.d/CentOS-*
 sed -i -e "s|releasever|releasever-stream|g" /etc/yum.repos.d/CentOS-*
 yum clean all && yum makecache
@@ -105,8 +222,8 @@ if [[ -z $vi ]]; then
 apt install iputils-ping iproute2 systemctl -y
 fi
 
-packages=("curl" "openssl" "iptables" "tar" "expect" "wget" "xxd" "python3" "qrencode" "git")
-inspackages=("curl" "openssl" "iptables" "tar" "expect" "wget" "xxd" "python3" "qrencode" "git")
+packages=("curl" "openssl" "iptables" "tar" "wget" "xxd" "python3" "qrencode" "git")
+inspackages=("curl" "openssl" "iptables" "tar" "wget" "xxd" "python3" "qrencode" "git")
 for i in "${!packages[@]}"; do
 package="${packages[$i]}"
 inspackage="${inspackages[$i]}"
@@ -141,18 +258,18 @@ fi
 fi
 
 v4v6(){
-v4=$(curl -s4m5 icanhazip.com -k)
-v6=$(curl -s6m5 icanhazip.com -k)
+v4=$(curl -s4m5 https://icanhazip.com || true)
+v6=$(curl -s6m5 https://icanhazip.com || true)
 }
 
 warpcheck(){
-wgcfv6=$(curl -s6m5 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
-wgcfv4=$(curl -s4m5 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
+wgcfv6=$(curl -s6m5 https://www.cloudflare.com/cdn-cgi/trace | grep warp | cut -d= -f2)
+wgcfv4=$(curl -s4m5 https://www.cloudflare.com/cdn-cgi/trace | grep warp | cut -d= -f2)
 }
 
 v6(){
 v4orv6(){
-if [ -z "$(curl -s4m5 icanhazip.com -k)" ]; then
+if [ -z "$(curl -s4m5 https://icanhazip.com || true)" ]; then
 echo
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 yellow "检测到 纯IPV6 VPS，添加NAT64"
@@ -161,7 +278,7 @@ ipv=prefer_ipv6
 else
 ipv=prefer_ipv4
 fi
-if [ -n "$(curl -s6m5 icanhazip.com -k)" ]; then
+if [ -n "$(curl -s6m5 https://icanhazip.com || true)" ]; then
 endip=2606:4700:d0::a29f:c001
 else
 endip=162.159.192.1
@@ -233,8 +350,7 @@ else
 sbcore=$(curl -Ls https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box | grep -Eo '"1\.10[0-9\.]*",'  | sed -n 1p | tr -d '",')
 fi
 sbname="sing-box-$sbcore-linux-$cpu"
-curl -L -o /etc/s-box/sing-box.tar.gz  -# --retry 2 https://github.com/SagerNet/sing-box/releases/download/v$sbcore/$sbname.tar.gz
-if [[ -f '/etc/s-box/sing-box.tar.gz' ]]; then
+if download_release_asset_with_digest "SagerNet/sing-box" "v$sbcore" "$sbname.tar.gz" "/etc/s-box/sing-box.tar.gz"; then
 tar xzf /etc/s-box/sing-box.tar.gz -C /etc/s-box
 mv /etc/s-box/$sbname/sing-box /etc/s-box
 rm -rf /etc/s-box/{sing-box.tar.gz,$sbname}
@@ -313,7 +429,7 @@ readp "请选择【1-2】：" menu
 if [ -z "$menu" ] || [ "$menu" = "1" ] ; then
 zqzs
 else
-bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/acme-yg/main/acme.sh)
+acme
 if [[ ! -f /root/ygkkkca/cert.crt && ! -f /root/ygkkkca/private.key && ! -s /root/ygkkkca/cert.crt && ! -s /root/ygkkkca/private.key ]]; then
 red "Acme证书申请失败，继续使用自签证书" 
 zqzs
@@ -939,7 +1055,7 @@ echo "$server_ipcl" > /etc/s-box/server_ipcl.log
 fi
 else
 yellow "VPS并不是双栈VPS，不支持IP配置输出的切换"
-serip=$(curl -s4m5 icanhazip.com -k || curl -s6m5 icanhazip.com -k)
+serip=$(curl -s4m5 https://icanhazip.com || curl -s6m5 https://icanhazip.com)
 if [[ "$serip" =~ : ]]; then
 sbdnsip='tls://[2001:4860:4860::8888]/dns-query'
 echo "$sbdnsip" > /etc/s-box/sbdnsip.log
@@ -3302,8 +3418,10 @@ case $(uname -m) in
 aarch64) cpu=arm64;;
 x86_64) cpu=amd64;;
 esac
-curl -L -o /etc/s-box/cloudflared -# --retry 2 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$cpu
-#curl -L -o /etc/s-box/cloudflared -# --retry 2 https://gitlab.com/rwkgyg/sing-box-yg/-/raw/main/$cpu
+if ! download_release_asset_with_digest "cloudflare/cloudflared" "$CLOUDFLARED_TAG" "cloudflared-linux-$cpu" "/etc/s-box/cloudflared"; then
+red "下载 cloudflared 失败，请检查网络后重试"
+return 1
+fi
 chmod +x /etc/s-box/cloudflared
 fi
 }
@@ -3312,7 +3430,13 @@ cfargoym(){
 echo
 if [[ -f /etc/s-box/sbargotoken.log && -f /etc/s-box/sbargoym.log ]]; then
 green "当前Argo固定隧道域名：$(cat /etc/s-box/sbargoym.log 2>/dev/null)"
-green "当前Argo固定隧道Token：$(cat /etc/s-box/sbargotoken.log 2>/dev/null)"
+current_argo_token=$(cat /etc/s-box/sbargotoken.log 2>/dev/null)
+if [[ ${#current_argo_token} -gt 8 ]]; then
+current_argo_token="${current_argo_token:0:4}****${current_argo_token: -4}"
+else
+current_argo_token="(hidden)"
+fi
+green "当前Argo固定隧道Token：${current_argo_token}"
 fi
 echo
 green "请确保Cloudflare官网 --- Zero Trust --- Networks --- Tunnels已设置完成"
@@ -3321,7 +3445,7 @@ yellow "2：停止Argo固定隧道"
 yellow "0：返回上层"
 readp "请选择【0-2】：" menu
 if [ "$menu" = "1" ]; then
-cloudflaredargo
+cloudflaredargo || return 1
 readp "输入Argo固定隧道Token: " argotoken
 readp "输入Argo固定隧道域名: " argoym
 if [[ -n $(ps -e | grep cloudflared) ]]; then
@@ -3334,6 +3458,7 @@ sleep 20
 fi
 echo ${argoym} > /etc/s-box/sbargoym.log
 echo ${argotoken} > /etc/s-box/sbargotoken.log
+chmod 600 /etc/s-box/sbargotoken.log >/dev/null 2>&1
 crontab -l > /tmp/crontab.tmp
 sed -i '/sbargoympid/d' /tmp/crontab.tmp
 echo '@reboot sleep 10 && /bin/bash -c "nohup setsid /etc/s-box/cloudflared tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run --token $(cat /etc/s-box/sbargotoken.log 2>/dev/null) >/dev/null 2>&1 & pid=\$! && echo \$pid > /etc/s-box/sbargoympid.log"' >> /tmp/crontab.tmp
@@ -3361,7 +3486,7 @@ yellow "2：停止Argo临时隧道"
 yellow "0：返回上层"
 readp "请选择【0-2】：" menu
 if [ "$menu" = "1" ]; then
-cloudflaredargo
+cloudflaredargo || return 1
 i=0
 while [ $i -le 4 ]; do let i++
 yellow "第$i次刷新验证Cloudflared Argo临时隧道域名有效性，请稍等……"
@@ -3989,6 +4114,11 @@ readp "输入登录邮箱: " email
 readp "输入访问令牌: " token
 readp "输入用户名: " userid
 readp "输入项目名: " project
+if [[ -z "$token" ]]; then
+yellow "访问令牌为空，取消设置"
+cd
+return
+fi
 echo
 green "多台VPS共用一个令牌及项目名，可创建多个分支订阅链接"
 green "回车跳过表示不新建，仅使用主分支main订阅链接(首台VPS建议回车跳过)"
@@ -4003,35 +4133,31 @@ gitlab_ml=":${gitlabml}"
 git_sk="${gitlabml}"
 echo "${gitlab_ml}" > /etc/s-box/gitlab_ml_ml
 fi
-echo "$token" > /etc/s-box/gitlabtoken.txt
+rm -f /etc/s-box/gitlabtoken.txt /etc/s-box/gitpush.sh
 rm -rf /etc/s-box/.git
 git init >/dev/null 2>&1
 git add sing_box_client.json clash_meta_client.yaml jh_sub.txt >/dev/null 2>&1
-git config --global user.email "${email}" >/dev/null 2>&1
-git config --global user.name "${userid}" >/dev/null 2>&1
+git config user.email "${email}" >/dev/null 2>&1
+git config user.name "${userid}" >/dev/null 2>&1
 git commit -m "commit_add_$(date +"%F %T")" >/dev/null 2>&1
 branches=$(git branch)
 if [[ $branches == *master* ]]; then
 git branch -m master main >/dev/null 2>&1
 fi
-git remote add origin https://${token}@gitlab.com/${userid}/${project}.git >/dev/null 2>&1
+git remote add origin "https://gitlab.com/${userid}/${project}.git" >/dev/null 2>&1
 if [[ $(ls -a | grep '^\.git$') ]]; then
-cat > /etc/s-box/gitpush.sh <<EOF
-#!/usr/bin/expect
-spawn bash -c "git push -f origin main${gitlab_ml}"
-expect "Password for 'https://$(cat /etc/s-box/gitlabtoken.txt 2>/dev/null)@gitlab.com':"
-send "$(cat /etc/s-box/gitlabtoken.txt 2>/dev/null)\r"
-interact
-EOF
-chmod +x gitpush.sh
-./gitpush.sh "git push -f origin main${gitlab_ml}" cat /etc/s-box/gitlabtoken.txt >/dev/null 2>&1
-echo "https://gitlab.com/api/v4/projects/${userid}%2F${project}/repository/files/sing_box_client.json/raw?ref=${git_sk}&private_token=${token}" > /etc/s-box/sing_box_gitlab.txt
-echo "https://gitlab.com/api/v4/projects/${userid}%2F${project}/repository/files/clash_meta_client.yaml/raw?ref=${git_sk}&private_token=${token}" > /etc/s-box/clash_meta_gitlab.txt
-echo "https://gitlab.com/api/v4/projects/${userid}%2F${project}/repository/files/jh_sub.txt/raw?ref=${git_sk}&private_token=${token}" > /etc/s-box/jh_sub_gitlab.txt
+if gitlab_push_with_token "$token" "$gitlab_ml"; then
+echo "https://gitlab.com/${userid}/${project}/-/raw/${git_sk}/sing_box_client.json" > /etc/s-box/sing_box_gitlab.txt
+echo "https://gitlab.com/${userid}/${project}/-/raw/${git_sk}/clash_meta_client.yaml" > /etc/s-box/clash_meta_gitlab.txt
+echo "https://gitlab.com/${userid}/${project}/-/raw/${git_sk}/jh_sub.txt" > /etc/s-box/jh_sub_gitlab.txt
 clsbshow
+else
+yellow "推送失败，请检查访问令牌权限或项目路径后重试"
+fi
 else
 yellow "设置Gitlab订阅链接失败，请反馈"
 fi
+unset token
 cd
 else
 changeserv
@@ -4044,13 +4170,22 @@ if [[ $(ls -a | grep '^\.git$') ]]; then
 if [ -f /etc/s-box/gitlab_ml_ml ]; then
 gitlab_ml=$(cat /etc/s-box/gitlab_ml_ml)
 fi
+readp "输入访问令牌(仅本次使用，不落盘): " token
+if [[ -z "$token" ]]; then
+yellow "访问令牌为空，取消推送"
+cd
+return
+fi
 git rm --cached sing_box_client.json clash_meta_client.yaml jh_sub.txt >/dev/null 2>&1
 git commit -m "commit_rm_$(date +"%F %T")" >/dev/null 2>&1
 git add sing_box_client.json clash_meta_client.yaml jh_sub.txt >/dev/null 2>&1
 git commit -m "commit_add_$(date +"%F %T")" >/dev/null 2>&1
-chmod +x gitpush.sh
-./gitpush.sh "git push -f origin main${gitlab_ml}" cat /etc/s-box/gitlabtoken.txt >/dev/null 2>&1
+if gitlab_push_with_token "$token" "$gitlab_ml"; then
 clsbshow
+else
+yellow "推送失败，请检查访问令牌权限后重试"
+fi
+unset token
 else
 yellow "未设置Gitlab订阅链接"
 fi
@@ -4081,6 +4216,7 @@ green "订阅链接如下："
 blue "$(cat /etc/s-box/jh_sub_gitlab.txt 2>/dev/null)"
 echo
 yellow "可以在网页上输入订阅链接查看配置内容，如果无配置内容，请自检Gitlab相关设置并重置"
+yellow "安全提示：当前链接不携带访问令牌，请将对应文件设置为可公开读取，或改用本地订阅分享"
 echo
 }
 
@@ -4184,24 +4320,12 @@ green "可以先在选项5-1或5-2使用完整域名分流：cloudflare.com"
 green "然后使用任意节点打开网页https://cloudflare.com/cdn-cgi/trace，查看当前WARP账户类型"
 elif  [ "$menu" = "2" ]; then
 green "请稍等……更新中……"
-if [ -z $(curl -s4m5 icanhazip.com -k) ]; then
-curl -sSL https://gitlab.com/rwkgyg/CFwarp/raw/main/point/endip.sh -o endip.sh && chmod +x endip.sh && (echo -e "1\n2\n") | bash endip.sh > /dev/null 2>&1
-nwgip=$(awk -F, 'NR==2 {print $1}' /root/result.csv 2>/dev/null | grep -o '\[.*\]' | tr -d '[]')
-nwgpo=$(awk -F, 'NR==2 {print $1}' /root/result.csv 2>/dev/null | awk -F "]" '{print $2}' | tr -d ':')
-else
-curl -sSL https://gitlab.com/rwkgyg/CFwarp/raw/main/point/endip.sh -o endip.sh && chmod +x endip.sh && (echo -e "1\n1\n") | bash endip.sh > /dev/null 2>&1
-nwgip=$(awk -F, 'NR==2 {print $1}' /root/result.csv 2>/dev/null | awk -F: '{print $1}')
-nwgpo=$(awk -F, 'NR==2 {print $1}' /root/result.csv 2>/dev/null | awk -F: '{print $2}')
-fi
-a=$(cat /root/result.csv 2>/dev/null | awk -F, '$3!="timeout ms" {print} ' | sed -n '2p' | awk -F ',' '{print $2}')
-if [[ -z $a || $a = "100.00%" ]]; then
-if [[ -z $(curl -s4m5 icanhazip.com -k) ]]; then
+if [ -z "$(curl -s4m5 https://icanhazip.com || true)" ]; then
 nwgip=2606:4700:d0::a29f:c001
 nwgpo=2408
 else
 nwgip=162.159.192.1
 nwgpo=2408
-fi
 fi
 sed -i "157s#$wgip#$nwgip#g" /etc/s-box/sb10.json
 sed -i "158s#$wgpo#$nwgpo#g" /etc/s-box/sb10.json
@@ -4221,8 +4345,8 @@ fi
 sbymfl(){
 sbport=$(cat /etc/s-box/sbwpph.log 2>/dev/null | awk '{print $3}' | awk -F":" '{print $NF}') 
 sbport=${sbport:-'40000'}
-resv1=$(curl -s --socks5 localhost:$sbport icanhazip.com)
-resv2=$(curl -sx socks5h://localhost:$sbport icanhazip.com)
+resv1=$(curl -s --socks5 localhost:$sbport https://icanhazip.com)
+resv2=$(curl -sx socks5h://localhost:$sbport https://icanhazip.com)
 if [[ -z $resv1 && -z $resv2 ]]; then
 warp_s4_ip='Socks5-IPV4未启动，黑名单模式'
 warp_s6_ip='Socks5-IPV6未启动，黑名单模式'
@@ -4623,16 +4747,20 @@ rm /tmp/crontab.tmp
 }
 
 lnsb(){
-rm -rf /usr/bin/sb
-curl -L -o /usr/bin/sb -# --retry 2 --insecure https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh
+if [[ -f "${BASH_SOURCE[0]}" && -r "${BASH_SOURCE[0]}" ]]; then
+cat "${BASH_SOURCE[0]}" > /usr/bin/sb
 chmod +x /usr/bin/sb
+else
+red "当前运行环境不可读取本地脚本，已阻止远程覆盖更新，请手动更新 /usr/bin/sb"
+return 1
+fi
 }
 
 upsbyg(){
 if [[ ! -f '/usr/bin/sb' ]]; then
 red "未正常安装Sing-box-yg" && exit
 fi
-lnsb
+lnsb || return 1
 curl -sL https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/version | awk -F "更新内容" '{print $1}' | head -n 1 > /etc/s-box/v
 green "Sing-box-yg安装脚本升级成功" && sleep 5 && sb
 }
@@ -4668,8 +4796,7 @@ fi
 if [[ -n $upcore ]]; then
 green "开始下载并更新Sing-box内核……请稍等"
 sbname="sing-box-$upcore-linux-$cpu"
-curl -L -o /etc/s-box/sing-box.tar.gz  -# --retry 2 https://github.com/SagerNet/sing-box/releases/download/v$upcore/$sbname.tar.gz
-if [[ -f '/etc/s-box/sing-box.tar.gz' ]]; then
+if download_release_asset_with_digest "SagerNet/sing-box" "v$upcore" "$sbname.tar.gz" "/etc/s-box/sing-box.tar.gz"; then
 tar xzf /etc/s-box/sing-box.tar.gz -C /etc/s-box
 mv /etc/s-box/$sbname/sing-box /etc/s-box
 rm -rf /etc/s-box/{sing-box.tar.gz,$sbname}
@@ -4712,7 +4839,7 @@ iptables -t nat -F PREROUTING >/dev/null 2>&1
 netfilter-persistent save >/dev/null 2>&1
 service iptables save >/dev/null 2>&1
 green "Sing-box卸载完成！"
-blue "欢迎继续使用Sing-box-yg脚本：bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh)"
+blue "欢迎继续使用Sing-box-yg脚本：请先下载并审计脚本，再本地执行安装"
 echo
 }
 
@@ -4826,19 +4953,17 @@ fi
 }
 
 acme(){
-#bash <(curl -Ls https://gitlab.com/rwkgyg/acme-script/raw/main/acme.sh)
-bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/acme-yg/main/acme.sh)
+run_pinned_script "yonggekkk/acme-yg" "$ACME_REPO_COMMIT" "acme.sh" "$ACME_SCRIPT_SHA256"
 }
 cfwarp(){
-#bash <(curl -Ls https://gitlab.com/rwkgyg/CFwarp/raw/main/CFwarp.sh)
-bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/warp-yg/main/CFwarp.sh)
+run_pinned_script "yonggekkk/warp-yg" "$WARP_REPO_COMMIT" "CFwarp.sh" "$WARP_SCRIPT_SHA256"
 }
 bbr(){
 if [[ $vi =~ lxc|openvz ]]; then
 yellow "当前VPS的架构为 $vi，不支持开启原版BBR加速" && sleep 2 && exit 
 else
 green "点击任意键，即可开启BBR加速，ctrl+c退出"
-bash <(curl -Ls https://raw.githubusercontent.com/teddysun/across/master/bbr.sh)
+run_pinned_script "teddysun/across" "$BBR_REPO_COMMIT" "bbr.sh" "$BBR_SCRIPT_SHA256"
 fi
 }
 
@@ -4948,10 +5073,12 @@ sbactive
 ins(){
 if [ ! -e /etc/s-box/sbwpph ]; then
 case $(uname -m) in
-aarch64) cpu=arm64;;
-x86_64) cpu=amd64;;
+aarch64) cpu=arm64; expected_sha="$SBWPPH_ARM64_SHA256";;
+x86_64) cpu=amd64; expected_sha="$SBWPPH_AMD64_SHA256";;
+*) red "当前架构不支持sbwpph自动安装：$(uname -m)" && return 1;;
 esac
-curl -L -o /etc/s-box/sbwpph -# --retry 2 --insecure https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sbwpph_$cpu
+safe_download "https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sbwpph_$cpu" "/etc/s-box/sbwpph" || { red "下载 sbwpph 失败"; return 1; }
+verify_sha256_or_fail "/etc/s-box/sbwpph" "$expected_sha" || return 1
 chmod +x /etc/s-box/sbwpph
 fi
 if [[ -n $(ps -e | grep sbwpph) ]]; then
@@ -5004,8 +5131,8 @@ if [ "$menu" = "1" ]; then
 ins
 nohup setsid /etc/s-box/sbwpph -b 127.0.0.1:$port --gool -$sw46 --endpoint 162.159.192.1:2408 >/dev/null 2>&1 & echo "$!" > /etc/s-box/sbwpphid.log
 green "申请IP中……请稍等……" && sleep 20
-resv1=$(curl -s --socks5 localhost:$port icanhazip.com)
-resv2=$(curl -sx socks5h://localhost:$port icanhazip.com)
+resv1=$(curl -s --socks5 localhost:$port https://icanhazip.com)
+resv2=$(curl -sx socks5h://localhost:$port https://icanhazip.com)
 if [[ -z $resv1 && -z $resv2 ]]; then
 red "WARP-plus-Socks5的IP获取失败" && unins && exit
 else
@@ -5056,8 +5183,8 @@ echo '
 readp "可选择国家地区（输入末尾两个大写字母，如美国，则输入US）：" guojia
 nohup setsid /etc/s-box/sbwpph -b 127.0.0.1:$port --cfon --country $guojia -$sw46 --endpoint 162.159.192.1:2408 >/dev/null 2>&1 & echo "$!" > /etc/s-box/sbwpphid.log
 green "申请IP中……请稍等……" && sleep 20
-resv1=$(curl -s --socks5 localhost:$port icanhazip.com)
-resv2=$(curl -sx socks5h://localhost:$port icanhazip.com)
+resv1=$(curl -s --socks5 localhost:$port https://icanhazip.com)
+resv2=$(curl -sx socks5h://localhost:$port https://icanhazip.com)
 if [[ -z $resv1 && -z $resv2 ]]; then
 red "WARP-plus-Socks5的IP获取失败，尝试换个国家地区吧" && unins && exit
 else
